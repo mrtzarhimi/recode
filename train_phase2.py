@@ -175,7 +175,9 @@ def main():
     if a.save_checkpoints:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
     v = evaluate(model, d, stats0, a, dev)
-    best, wait, best_epoch = v['total'], 0, -1
+    select_rec_only = a.align_w == 0 and a.sup_w == 0
+    selection_score = lambda metrics: metrics['rec_unweighted'] if select_rec_only else metrics['total']
+    best, wait, best_epoch = selection_score(v), 0, -1
     save_checkpoint(path, model, ck['cfg'], meta, a, -1, v, aligned=True, source_model_id=source_model_id)
     if a.save_checkpoints:
         save_checkpoint(checkpoint_dir / 'epoch_00000.pt', model, ck['cfg'], meta, a, -1, v,
@@ -207,9 +209,10 @@ def main():
         if a.save_checkpoints:
             save_checkpoint(checkpoint_dir / f'epoch_{epoch + 1:05d}.pt', model, model_cfg,
                             meta, a, epoch, v, aligned=True, source_model_id=source_model_id)
-        scheduler.step(v['total'])
-        if v['total'] < best:
-            best, wait, best_epoch = v['total'], 0, epoch
+        current_score = selection_score(v)
+        scheduler.step(current_score)
+        if current_score < best:
+            best, wait, best_epoch = current_score, 0, epoch
             save_checkpoint(path, model, model_cfg, meta, a, epoch, v, aligned=True, source_model_id=source_model_id)
         else:
             wait += 1

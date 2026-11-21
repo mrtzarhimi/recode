@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>NoMAD · Cross-day performance</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="report-data.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <main class="page-shell">
+    <header class="page-header">
+      <div>
+        <h1>Cross-day performance</h1>
+        <p id="report-summary" class="header-summary">No report data loaded</p>
+      </div>
+      <div class="header-actions">
+        <button class="button button-secondary" id="export-button" type="button" disabled>Export results</button>
+        <button class="button button-primary" id="add-results" type="button">Add results</button>
+        <input id="result-file" type="file" accept="application/json,.json" hidden>
+      </div>
+    </header>
+
+    <section id="empty-state" class="empty-state" aria-labelledby="empty-title" hidden>
+      <div class="empty-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <h2 id="empty-title">Your results will appear here</h2>
+      <p>Add an evaluation JSON or a cross-day summary to compare transfer conditions, target days, and seeds.</p>
+      <button class="button button-primary" id="empty-add-results" type="button">Add the first result</button>
+    </section>
+
+    <div id="report-content" hidden>
+      <section class="toolbar" aria-label="Report filters">
+        <label class="select-field">
+          <span>Evaluation split</span>
+          <select id="split-select" aria-label="Evaluation split"></select>
+        </label>
+        <label class="select-field">
+          <span>Readout</span>
+          <select id="method-select" aria-label="Readout method"></select>
+        </label>
+        <label class="select-field">
+          <span>Target</span>
+          <select id="metric-select" aria-label="Target metric"></select>
+        </label>
+        <span class="filter-note" id="filter-note"></span>
+      </section>
+
+      <section class="performance-section" aria-labelledby="performance-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="performance-title">Mean force R² by target day</h2>
+            <p id="chart-caption">Seed mean ± SD for each Day-K</p>
+          </div>
+          <span class="sample-count" id="chart-count"></span>
+        </div>
+        <div class="chart-frame">
+          <svg id="performance-chart" viewBox="0 0 1080 340" role="img" aria-labelledby="chart-title chart-description"></svg>
+          <p class="chart-empty" id="chart-empty" hidden>No comparable conditions are available for this readout and target.</p>
+        </div>
+        <div class="legend" id="chart-legend" aria-label="Comparison conditions"></div>
+      </section>
+
+      <section class="overall-band" aria-labelledby="overall-title">
+        <div class="overall-label">
+          <h2 id="overall-title">Overall NoMAD</h2>
+          <p>Across Day-K sessions</p>
+        </div>
+        <div class="overall-main">
+          <strong id="overall-nomad-value">—</strong>
+          <span id="overall-nomad-label">mean ± SD across Day-K means</span>
+          <p id="overall-method-note"></p>
+        </div>
+        <div class="overall-comparison" id="overall-comparison" aria-label="Overall comparison conditions"></div>
+      </section>
+
+      <section class="table-section" aria-labelledby="table-title">
+        <div class="section-heading table-heading">
+          <div>
+            <h2 id="table-title">Per-Day-K results</h2>
+            <p>Mean ± SD across seeds. Expand a day to inspect individual runs.</p>
+          </div>
+          <span class="sample-count" id="table-count"></span>
+        </div>
+        <div class="table-scroll">
+          <table id="day-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <details class="provenance">
+        <summary>Interpretation and provenance</summary>
+        <div class="provenance-copy">
+          <p><strong>Unchanged Day-0 transfer</strong> uses Day-0 normalization. <strong>Normalization-only</strong> uses Day-K training neural statistics, so it is target-calibrated and not zero-shot. <strong>NoMAD alignment</strong> uses target training data; validation may select its checkpoint.</p>
+          <p>Only the selected split is aggregated. Evaluation reports may select inlier trials and movement-onset windows from behavior; scores are therefore conditional on those eligible observations. No result is evidence of improvement by itself: compare the same target days, split, readout, and metric.</p>
+          <p id="provenance-reference"></p>
+        </div>
+      </details>
+    </div>
+
+    <dialog id="import-dialog" class="import-dialog" aria-labelledby="import-title">
+      <form method="dialog" id="import-form">
+        <div class="dialog-heading">
+          <div>
+            <h2 id="import-title">Add evaluation result</h2>
+            <p id="import-filename"></p>
+          </div>
+          <button class="icon-button" value="cancel" aria-label="Close">×</button>
+        </div>
+        <div id="import-fields">
+          <label class="form-field" id="dayk-field">
+            <span>Day-K label</span>
+            <input id="dayk-input" name="dayk" autocomplete="off" required>
+          </label>
+          <label class="form-field">
+            <span>Run seed</span>
+            <input id="seed-input" name="seed" type="number" step="1" required>
+            <small>Prefilled from args.seed; override it if that is the decoder-CV seed instead.</small>
+          </label>
+        </div>
+        <p id="import-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button class="button button-secondary" value="cancel">Cancel</button>
+          <button class="button button-primary" id="confirm-import" value="default">Add result</button>
+        </div>
+      </form>
+    </dialog>
+
+    <footer class="page-footer">
+      <span>NoMAD results · local report</span>
+      <span id="footer-status" role="status" aria-live="polite"></span>
+    </footer>
+  </main>
+</body>
+</html>

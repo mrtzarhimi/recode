@@ -145,6 +145,13 @@ fixed `--split_seed` keep target trial partitions common across conditions.
 `--epochs` sets a common update budget; use a smaller value for a smoke run and
 the prespecified budget for the study.
 
+For a pure reconstruction run (`--align_w 0 --sup_w 0`), phase 2 selects
+`model_dayk.pt` by unweighted validation spike NLL, so the reconstruction
+warm-up cannot make the initial checkpoint appear perfect. The evaluator also
+supports `--window_mode continuous` to score all valid causal bins within each
+trial when movement-onset windows are unavailable. Continuous-bin scores answer
+a different question from movement-onset scores and should be labeled as such.
+
 The current runner implements the primary fixed-decoder comparison. A fresh
 Day-K decoder probe, masked-channel reconstruction analysis, and Day-0
 pseudo-session control from the study outline remain follow-up analyses; the

@@ -15,7 +15,7 @@ from training_utils import model_fingerprint
 
 NOTICE = ('Normalization-only transfer and full alignment use training-only day-k calibration; unchanged transfer '
           'retains day-0 normalization. This is calibrated transfer, not zero-shot. '
-          'Movement-onset alignment is retrospective. Decoder tuning uses day-0 training trials only. '
+          'Decoder tuning uses day-0 training trials only. '
           'Test trials must not be used to tune models or pipeline settings.')
 
 def r2vw(y, prediction):
@@ -134,6 +134,24 @@ def trial_index(onsets, bounds, trials, bin_size, hist, N=SEG_LEN):
     return np.asarray(indices, dtype=np.int64).reshape(-1, pre + post), np.asarray(ids, dtype=np.int64)
 
 
+def continuous_trial_index(bounds, trials, hist, N=SEG_LEN):
+    """Use every eligible causal time bin, keeping model and decoder histories in-trial."""
+    if min(hist, N) < 1:
+        raise ValueError('History and model window lengths must be positive.')
+    indices, ids = [], []
+    for trial in np.asarray(trials, dtype=np.int64):
+        start, end = bounds[trial]
+        first = start + N + hist - 2
+        if first >= end:
+            continue
+        times = np.arange(first, end, dtype=np.int64)
+        indices.append(times[:, None])
+        ids.append(np.full(len(times), trial, dtype=np.int64))
+    if not indices:
+        return np.empty((0, 1), dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.concatenate(indices), np.concatenate(ids)
+
+
 def feature_times(idx, hist):
     requested = idx[..., None] - np.arange(hist - 1, -1, -1)
     times, inverse = np.unique(requested, return_inverse=True)
@@ -249,6 +267,9 @@ def main():
     p.add_argument('--ckpt0', default='runs/model_day0.pt')
     p.add_argument('--ckptk', default='runs/model_dayk.pt')
     p.add_argument('--hist', type=int, default=4)
+    p.add_argument('--window_mode', choices=('movement_onset', 'continuous'),
+                   default='movement_onset',
+                   help='Score movement windows or all valid causal bins contained within each trial.')
     p.add_argument('--split', choices=('test', 'validation'), default='test')
     p.add_argument('--bs', type=int, default=256)
     p.add_argument('--folds', type=int, default=10)
@@ -264,6 +285,8 @@ def main():
         torch.set_num_threads(a.threads)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if a.device == 'auto' else torch.device(a.device)
     torch.manual_seed(a.seed)
+    notice = NOTICE + ('Movement-onset selection is retrospective.' if a.window_mode == 'movement_onset'
+                       else ' Scores use all behavior-valid causal bins inside each trial.')
     ck0, ckk = read_checkpoint(a.ckpt0), read_checkpoint(a.ckptk)
     validate_pair(ck0, ckk)
     D = load_evaluation_data(a.data, ck0, ckk)
@@ -274,12 +297,18 @@ def main():
         trials = trials[day['behavior_valid_trials'][trials]]
         if not len(trials):
             raise ValueError(f'No inlier behavior trials remain in {label}.')
-        idx, ids = trial_index(day['onset'], day['bounds'], trials, D['bin_size'], a.hist)
+        if a.window_mode == 'movement_onset':
+            idx, ids = trial_index(day['onset'], day['bounds'], trials, D['bin_size'], a.hist)
+        else:
+            idx, ids = continuous_trial_index(day['bounds'], trials, a.hist)
         if not len(idx):
-            raise ValueError(f'No eligible {label} windows. Each trial must contain the decoding window plus full causal history.')
+            detail = ('Movement-onset windows require a valid go-cue movement onset and enough trial-contained history.'
+                      if a.window_mode == 'movement_onset' else
+                      'Continuous windows require at least one behavior-valid trial long enough for model and decoder history.')
+            raise ValueError(f'No eligible {label} windows. {detail}')
         times, lookup = feature_times(idx, a.hist)
         sections[label] = dict(idx=idx, ids=ids, times=times, lookup=lookup, day=day)
-        print(f'{label}: {len(np.unique(ids))}/{len(trials)} eligible trials, {len(idx)} onset windows')
+        print(f'{label}: {len(np.unique(ids))}/{len(trials)} eligible trials, {len(idx)} {a.window_mode} windows')
     if len(np.unique(sections['train0']['ids'])) < 2:
         raise ValueError('Need at least two eligible day-0 training trials.')
     base = model_from_checkpoint(ck0, device)
@@ -339,16 +368,16 @@ def main():
         scores = {name: r2vw(section['day']['b'][section['idx']][..., cols], section[feature][..., cols])
                   for name, cols in targets.items()}
         rows.append(dict(method='LFADS behavior readout', split=label, scores=scores))
-    print('\n' + NOTICE)
+    print('\n' + notice)
     if a.split == 'validation':
         print('Validation influenced checkpoint selection; these are not independent test estimates.')
     print('Targets: raw force and EMG units, without clipping; identical bins for every method.')
-    print(f'Baseline: one-sided Gaussian, sigma={a.smooth_ms:g} ms, limited to {SEG_LEN} bins; model history={SEG_LEN} bins; Wiener history={a.hist} bins.')
+    print(f'Window mode: {a.window_mode}. Baseline: one-sided Gaussian, sigma={a.smooth_ms:g} ms, limited to {SEG_LEN} bins; model history={SEG_LEN} bins; Wiener history={a.hist} bins.')
     print(f'\n{"method":26s} {"split":30s}' + ''.join(f'{name + " R2":>12s}' for name in targets))
     for row in rows:
         print(f'{row["method"]:26s} {row["split"]:30s}' + ''.join(f'{row["scores"][name]:12.4f}' for name in targets))
     if a.out:
-        report = dict(notice=NOTICE, args=vars(a), reference_sha256=ck0['data']['day0']['sha256'],
+        report = dict(notice=notice, args=vars(a), reference_sha256=ck0['data']['day0']['sha256'],
                       target_sha256=ckk['data']['dayk']['sha256'], reference_model_id=ck0['model_id'],
                       target_model_id=ckk['model_id'], split=a.split,
                       reference_epoch=ck0['epoch'], alignment_epoch=ckk['epoch'],
