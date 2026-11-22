@@ -3,21 +3,22 @@ import argparse
 import hashlib
 import json
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+from scipy.fft import dst, idst
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import cheby1, sosfiltfilt
 
 SEG_LEN, OVERLAP = 30, 6  # 600 ms segments, 120 ms overlap at 20 ms bins
+PREPROCESSING_VERSION = 7
 BEHAVIOR_LIMITS = np.asarray([[-1500, 800], [-1100, 600]], dtype=np.float32)
 DERIVATIVE_DEFINITION = 'backward_difference_per_second_reset_at_trial_owned_interval_start'
 BEHAVIOR_MASK_POLICY = 'force_bounds_and_difference_dependency_per_bin_whole_force_trial_evaluation'
-BEHAVIOR_RESAMPLING = 'native_cheby1_sos_zero_phase_then_decimate_per_trial_owned_interval'
+BEHAVIOR_RESAMPLING = 'native_cheby1_zero_phase_dst1_odd_reflection_then_decimate_per_trial_owned_interval'
 BEHAVIOR_FILTER_ORDER = 500
 BEHAVIOR_FILTER_RIPPLE_DB = 0.05
 BEHAVIOR_FILTER_PASSBAND_NYQUIST_FRACTION = 0.8
-BEHAVIOR_FILTER_PADLEN = 500
 
 
 def _str(r):
@@ -128,6 +129,23 @@ def _bin_xds(d, bin_size, use_emg):
     return times[keep], np.asarray(counts, np.float32)[keep], force, emg
 
 
+@lru_cache(maxsize=128)
+def _cheby1_zero_phase_gain(length, ratio):
+    # DST-I frequencies on the odd extension have normalized Nyquist units k/(length - 1).
+    nyquist_fraction = np.arange(1, length - 1) / (length - 1)
+    cutoff = BEHAVIOR_FILTER_PASSBAND_NYQUIST_FRACTION / ratio
+    warped = np.tan(np.pi / 2 * nyquist_fraction) / np.tan(np.pi / 2 * cutoff)
+    ripple = np.expm1(BEHAVIOR_FILTER_RIPPLE_DB * np.log(10) / 10)
+    passband = warped <= 1
+    gain = np.empty_like(warped)
+    polynomial = np.cos(BEHAVIOR_FILTER_ORDER * np.arccos(warped[passband]))
+    gain[passband] = 1 / (1 + ripple * polynomial ** 2)
+    # Use reciprocal exponentials to evaluate 1/(1 + ripple*cosh(phase)**2).
+    q = np.exp(-2 * BEHAVIOR_FILTER_ORDER * np.arccosh(warped[~passband]))
+    gain[~passband] = 4 * q / (4 * q + ripple * (1 + q) ** 2)
+    return gain
+
+
 def antialias_resample(values, native_times, target_times, intervals, native_bin, target_bin):
     """Filter native continuous signals independently inside owned intervals."""
     values = np.asarray(values, np.float64)
@@ -140,40 +158,61 @@ def antialias_resample(values, native_times, target_times, intervals, native_bin
         raise ValueError('Anti-alias filtering requires nonempty target data and trial bounds.')
     if not np.isfinite(values).all():
         raise ValueError('Native behavior values must be finite before anti-alias filtering.')
+    if not np.isfinite([native_bin, target_bin]).all() or min(native_bin, target_bin) <= 0:
+        raise ValueError('Behavior bin sizes must be finite and positive.')
     tolerance = max(1e-9, native_bin * 1e-6)
     if (not np.isfinite(native_times).all() or not np.isfinite(target_times).all() or
             np.any(np.diff(native_times) <= 0) or np.any(np.diff(target_times) <= 0)):
         raise ValueError('Behavior timestamps must be finite and strictly increasing.')
     if not np.allclose(np.diff(native_times), native_bin, rtol=0, atol=tolerance):
         raise ValueError('Native behavior timestamps must form a uniform grid for anti-alias filtering.')
+    if not np.allclose(np.diff(target_times), target_bin, rtol=0, atol=tolerance):
+        raise ValueError('Target behavior timestamps must form a uniform grid for anti-alias filtering.')
     ratio = target_bin / native_bin
     if ratio < 1 or not np.isclose(ratio, round(ratio)):
         raise ValueError('target_bin must be an integer multiple of native_bin.')
     ratio = int(round(ratio))
     result = np.empty((len(target_times), values.shape[1]), np.float32)
     starts = np.r_[0, intervals[1:, 0], len(target_times)]
-    sos = None
-    if ratio > 1:
-        cutoff = BEHAVIOR_FILTER_PASSBAND_NYQUIST_FRACTION / ratio
-        sos = cheby1(BEHAVIOR_FILTER_ORDER, BEHAVIOR_FILTER_RIPPLE_DB,
-                     cutoff, output='sos')
+    dc_gain = 10 ** (-BEHAVIOR_FILTER_RIPPLE_DB / 10) if BEHAVIOR_FILTER_ORDER % 2 == 0 else 1.0
     for left, right in zip(starts[:-1], starts[1:]):
         t0, t1 = target_times[left], target_times[right - 1] + target_bin
         raw_lo = int(np.searchsorted(native_times, t0 - tolerance, side='left'))
         raw_hi = int(np.searchsorted(native_times, t1 - tolerance, side='left'))
         source = values[raw_lo:raw_hi]
-        if sos is not None:
-            if len(source) <= BEHAVIOR_FILTER_PADLEN:
-                raise ValueError('Owned behavior interval is too short for the order-500 zero-phase anti-alias filter.')
-            source = sosfiltfilt(sos, source, axis=0, padlen=BEHAVIOR_FILTER_PADLEN)
+        if not len(source):
+            raise ValueError('Target behavior timestamps fall outside their native owned interval.')
         sample_idx = np.rint((target_times[left:right] - native_times[raw_lo]) / native_bin).astype(int)
         if (sample_idx < 0).any() or (sample_idx >= len(source)).any():
             raise ValueError('Target behavior timestamps fall outside their native owned interval.')
         if not np.allclose(native_times[raw_lo + sample_idx], target_times[left:right],
                            rtol=0, atol=tolerance):
             raise ValueError('Native and target behavior timestamps do not share an exact decimation grid.')
-        result[left:right] = source[sample_idx].astype(np.float32)
+        if ratio > 1:
+            # Remove the endpoint ramp to get a periodic odd reflection, then filter
+            # its sine modes. The symmetric zero-phase response scales the ramp by DC gain.
+            weight = np.linspace(0, 1, len(source))[:, None]
+            ramp = source[0] + weight * (source[-1] - source[0])
+            filtered = dc_gain * ramp
+            if len(source) > 2:
+                coeff = dst(source[1:-1] - ramp[1:-1], type=1, axis=0)
+                coeff *= _cheby1_zero_phase_gain(len(source), ratio)[:, None]
+                filtered[1:-1] += idst(coeff, type=1, axis=0)
+            source = filtered
+        result[left:right] = source[sample_idx]
+    if not np.isfinite(result).all():
+        raise ValueError('Resampled behavior must be finite.')
     return result
+
+
+def require_variable_force(force, context):
+    """Require finite force and at least one channel varying across observations."""
+    force = np.asarray(force)
+    if not force.size or not np.isfinite(force).all():
+        raise ValueError(f'{context}: force targets must be nonempty and finite.')
+    observations = force.reshape(-1, force.shape[-1])
+    if not np.any(observations != observations[0]):
+        raise ValueError(f'{context}: all channels have constant force targets.')
 
 
 def _load_day(xds_path, data_dir, fname, bin_size, use_emg=True):
@@ -204,6 +243,7 @@ def _load_day(xds_path, data_dir, fname, bin_size, use_emg=True):
     t, spikes, _, _ = _bin_xds(d, bin_size, use_emg)
     bounds = trial_bounds(t, d.trial_start_time, d.trial_end_time)
     force = antialias_resample(d.force, d.time_frame, t, bounds, d.bin_width, bin_size)
+    require_variable_force(force, fname)
     emg = (antialias_resample(d.EMG, d.time_frame, t, bounds, d.bin_width, bin_size)
            if use_emg else np.empty((len(t), 0), np.float32))
     return dict(t=t, spikes=spikes, units=[str(n) for n in d.unit_names], force=force, emg=emg,
@@ -359,6 +399,7 @@ def finalize(out, D0, DK, bin_size, n_force, emg_names, smooth_ms=20.0,
         bounds = validate_bounds(D['bounds'], len(D['x']))
         if D['b'].shape[1] < 4:
             raise ValueError('Behavior data must include two force and two force-derivative dimensions.')
+        require_variable_force(D['b'][:, :n_force].astype(np.float32), f'day{tag}')
         valid_bins, valid_trials = behavior_masks(D['b'], bounds)
         time = np.asarray(D.get('time', np.arange(len(D['x'])) * bin_size), np.float64)
         if (time.shape != (len(D['x']),) or not np.isfinite(time).all() or
@@ -373,7 +414,7 @@ def finalize(out, D0, DK, bin_size, n_force, emg_names, smooth_ms=20.0,
                        f'present_{tag}': np.asarray(D.get('present', np.ones(len(units), bool)), bool)})
         print(f'day{tag}: behavior-valid bins {valid_bins.sum()}/{len(valid_bins)}, '
               f'evaluation-inlier trials {valid_trials.sum()}/{len(valid_trials)}')
-    np.savez_compressed(out, format_version=6, bin_size=bin_size, smooth_ms=smooth_ms,
+    np.savez_compressed(out, format_version=PREPROCESSING_VERSION, bin_size=bin_size, smooth_ms=smooth_ms,
                         corr_thresh=corr_thresh, units=np.asarray(units, dtype=str),
                         behavior_limits=BEHAVIOR_LIMITS,
                         derivative_definition=DERIVATIVE_DEFINITION,
@@ -382,7 +423,6 @@ def finalize(out, D0, DK, bin_size, n_force, emg_names, smooth_ms=20.0,
                         behavior_filter_order=BEHAVIOR_FILTER_ORDER,
                         behavior_filter_ripple_db=BEHAVIOR_FILTER_RIPPLE_DB,
                         behavior_filter_passband_nyquist_fraction=BEHAVIOR_FILTER_PASSBAND_NYQUIST_FRACTION,
-                        behavior_filter_padlen=BEHAVIOR_FILTER_PADLEN,
                         reference_id=reference_id, target_id=target_id, n_force=n_force,
                         emg_names=np.asarray(emg_names, dtype=str), **arrays)
     print('saved', out)
@@ -494,15 +534,14 @@ def trial_mask(T, bounds, trials):
 
 def read_archive(path):
     with np.load(path, allow_pickle=False) as z:
-        if 'format_version' not in z or int(z['format_version']) != 6:
-            raise ValueError('Regenerate NPZ files with dataloader format 6; behavior anti-alias filtering is required.')
+        if 'format_version' not in z or int(z['format_version']) != PREPROCESSING_VERSION:
+            raise ValueError(f'{path}: regenerate NPZ files with dataloader format {PREPROCESSING_VERSION}.')
         conventions = dict(derivative_definition=DERIVATIVE_DEFINITION,
                            behavior_mask_policy=BEHAVIOR_MASK_POLICY,
                            behavior_resampling=BEHAVIOR_RESAMPLING,
                            behavior_filter_order=BEHAVIOR_FILTER_ORDER,
                            behavior_filter_ripple_db=BEHAVIOR_FILTER_RIPPLE_DB,
-                           behavior_filter_passband_nyquist_fraction=BEHAVIOR_FILTER_PASSBAND_NYQUIST_FRACTION,
-                           behavior_filter_padlen=BEHAVIOR_FILTER_PADLEN)
+                           behavior_filter_passband_nyquist_fraction=BEHAVIOR_FILTER_PASSBAND_NYQUIST_FRACTION)
         for key, expected in conventions.items():
             if key not in z:
                 raise ValueError(f'Archive preprocessing convention differs: {key}; regenerate the archive.')
@@ -534,6 +573,7 @@ def read_archive(path):
                 raise ValueError('Spikes must be finite nonnegative integer counts.')
             if not np.isfinite(b).all():
                 raise ValueError('Continuous-session behavior must be finite in every modeled bin.')
+            require_variable_force(b[:, :schema['n_force']], f'{path} {name}')
             present = z[f'present_{tag}'].astype(bool)
             valid_bins = z[f'behavior_valid_{tag}'].astype(bool)
             valid_trials = z[f'behavior_valid_trials_{tag}'].astype(bool)
@@ -611,13 +651,14 @@ def load_npz(path, device='cpu', seed=0, val_frac=0.2, test_frac=0.2,
         behavior_mask = mask & ref['behavior_valid']
         if not behavior_mask.any():
             raise ValueError('Day-0 training partitions contain no behavior within the source outlier limits.')
+        require_variable_force(ref['b'][behavior_mask, :schema['n_force']], 'Day-0 training')
         lo, hi = np.percentile(ref['b'][behavior_mask], [0.1, 99.9], axis=0)
-        meta = dict(version=6, **schema, split_seed=seed, val_frac=val_frac, test_frac=test_frac,
+        meta = dict(version=PREPROCESSING_VERSION, **schema, split_seed=seed, val_frac=val_frac, test_frac=test_frac,
                     channel_idx=torch.as_tensor(channels), selected_units=[schema['units'][i] for i in channels],
                     behavior_lo=torch.as_tensor(lo), behavior_span=torch.as_tensor(np.maximum(hi - lo, 1e-6)))
     else:
-        if reference.get('version') != 6:
-            raise ValueError('Regenerate data and retrain the reference model with pipeline version 6.')
+        if reference.get('version') != PREPROCESSING_VERSION:
+            raise ValueError(f'Regenerate data and retrain the reference model with pipeline version {PREPROCESSING_VERSION}.')
         meta = copy.deepcopy(reference)
         meta.pop('dayk', None)
         for key, value in schema.items():

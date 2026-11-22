@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from dataloader import load_npz
+from dataloader import PREPROCESSING_VERSION, load_npz
 from lfads import LFADS, lfads_kl, poisson_nll
 from nomad import mvn_kl, mvn_stats
 from training_utils import (Moments, autocast, batches, compact_training_data, data_metadata, finite_loss,
@@ -136,8 +136,8 @@ def main():
     if ck.get('aligned'):
         p.error('Expected an unaligned day-0 checkpoint.')
     saved = ck.get('data')
-    if saved is None or saved.get('version') != 6:
-        p.error('Regenerate data and retrain phase 1 with pipeline version 6 (behavior anti-alias filtering).')
+    if saved is None or saved.get('version') != PREPROCESSING_VERSION:
+        p.error(f'{a.ckpt}: regenerate data and retrain phase 1 with pipeline version {PREPROCESSING_VERSION}.')
     source_model_id = model_fingerprint(ck['cfg'], ck['state'])
     if ck.get('model_id') != source_model_id:
         p.error('Reference checkpoint identity is invalid.')
@@ -187,21 +187,25 @@ def main():
           f'weighted reconstruction {v["rec"]:.5f}')
     model_cfg = ck['cfg']
     del ck, D
+    last_batch = (len(d['tr']) - 1) // a.bs
     for epoch in range(a.epochs):
         a.epoch = epoch + 1
+        log_epoch = epoch % a.log_every == 0 or epoch == a.epochs - 1
         model.train()
         model.dropout_enabled = False
-        for xr, y, behavior_mask in batches(d, d['tr'], a.bs, dev, shuffle=True):
+        for batch, (xr, y, behavior_mask) in enumerate(batches(d, d['tr'], a.bs, dev, shuffle=True)):
             opt.zero_grad(set_to_none=True)
             with autocast(a, dev):
                 loss, parts = objective(model, (xr - mu) / sd, xr, y, behavior_mask, stats0, a)
             finite_loss(loss)
-            norm = lambda grads: torch.sqrt(sum(g.float().square().sum()
-                                                for g in grads if g is not None))
-            align_grad = norm(torch.autograd.grad(parts['align'], params,
-                                                   retain_graph=True, allow_unused=True))
-            rec_grad = norm(torch.autograd.grad(parts['rec'], params,
-                                                 retain_graph=True, allow_unused=True))
+            # Only the last batch's component gradients appear in the epoch log.
+            if log_epoch and batch == last_batch:
+                norm = lambda grads: torch.sqrt(sum(g.float().square().sum()
+                                                    for g in grads if g is not None))
+                align_grad = norm(torch.autograd.grad(parts['align'], params,
+                                                       retain_graph=True, allow_unused=True))
+                rec_grad = norm(torch.autograd.grad(parts['rec'], params,
+                                                     retain_graph=True, allow_unused=True))
             (loss * a.loss_scale).backward()
             torch.nn.utils.clip_grad_norm_(params, a.clip, error_if_nonfinite=True)
             opt.step()
@@ -216,7 +220,7 @@ def main():
             save_checkpoint(path, model, model_cfg, meta, a, epoch, v, aligned=True, source_model_id=source_model_id)
         else:
             wait += 1
-        if epoch % a.log_every == 0 or epoch == a.epochs - 1:
+        if log_epoch:
             print(f'epoch {epoch + 1} | valid {v["total"]:.5f} | weighted align {v["align"]:.5f} | '
                   f'weighted reconstruction {parts["rec"].item():.5f} | '
                   f'validation weighted reconstruction {v["rec"]:.5f} | '

@@ -19,8 +19,8 @@
     const text = String(label).toLowerCase();
     if (text.includes("unchanged day-0 transfer")) return "unchanged";
     if (text.includes("normalization-only")) return "normalization_only";
-    if (text.includes("supervised alignment")) return "alignment_supervised";
     if (text.includes("unsupervised alignment")) return "alignment_unsupervised";
+    if (text.includes("supervised alignment")) return "alignment_supervised";
     if (text.startsWith("day-0")) return "day0";
     return `other:${label}`;
   }

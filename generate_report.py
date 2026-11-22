@@ -35,10 +35,10 @@ def split_condition(label):
         return "unchanged"
     if "normalization-only" in value:
         return "normalization_only"
-    if "supervised alignment" in value:
-        return "alignment_supervised"
     if "unsupervised alignment" in value:
         return "alignment_unsupervised"
+    if "supervised alignment" in value:
+        return "alignment_supervised"
     if value.startswith("day-0"):
         return "day0"
     return "other:" + str(label)

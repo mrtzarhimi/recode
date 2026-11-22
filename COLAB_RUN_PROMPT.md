@@ -22,7 +22,7 @@ drive.mount('/content/drive')
 ```
 
 The folder must contain the trained Day 0 checkpoint (`model_day0.pt`) and one
-prepared format-6 `.npz` reference/target archive for each Day K session. The
+prepared format-7 `.npz` reference/target archive for each Day K session. The
 NPZs need to match the checkpoint's Day 0 reference and preprocessing. Raw
 session data alone is not enough for this sweep; prepare the archives first
 with this repository's `dataloader.py` if needed.
@@ -66,7 +66,7 @@ separate output directory. Do not use that run for scientific conclusions.
 
 > Starting from a fresh Colab runtime, clone my pushed repository at
 > `https://github.com/YOUR_GITHUB_USER/YOUR_REPO.git`, mount Google Drive, and
-> change into the cloned repository. My Day 0 checkpoint and prepared format-6
+> change into the cloned repository. My Day 0 checkpoint and prepared format-7
 > target archives are in `/content/drive/MyDrive/nomad`. Install the repository
 > requirements, confirm that the checkpoint and all six NPZ paths exist, and
 > confirm a GPU is available. If an input is missing or incompatible, stop and

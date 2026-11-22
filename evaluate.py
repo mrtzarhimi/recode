@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from scipy.linalg import cho_factor, cho_solve
 
-from dataloader import SEG_LEN, load_npz
+from dataloader import PREPROCESSING_VERSION, SEG_LEN, load_npz, require_variable_force
 from lfads import LFADS
 from training_utils import model_fingerprint
 
@@ -41,8 +41,8 @@ def r2vw(y, prediction):
 
 def read_checkpoint(path):
     ck = torch.load(path, map_location='cpu', weights_only=True)
-    if ck.get('data', {}).get('version') != 6:
-        raise ValueError('Regenerate data and retrain with pipeline version 6 for behavior anti-alias filtering.')
+    if ck.get('data', {}).get('version') != PREPROCESSING_VERSION:
+        raise ValueError(f'{path}: regenerate data and retrain with pipeline version {PREPROCESSING_VERSION}.')
     if ck.get('model_id') != model_fingerprint(ck['cfg'], ck['state']):
         raise ValueError('Checkpoint model identity is invalid.')
     return ck
@@ -73,7 +73,7 @@ def validate_pair(base, aligned):
                 'emg_names', 'units', 'selected_units', 'smooth_ms', 'corr_thresh',
                 'behavior_limits', 'derivative_definition', 'behavior_mask_policy',
                 'behavior_resampling', 'behavior_filter_order', 'behavior_filter_ripple_db',
-                'behavior_filter_passband_nyquist_fraction', 'behavior_filter_padlen'):
+                'behavior_filter_passband_nyquist_fraction'):
         if m0[key] != mk[key]:
             raise ValueError(f'Checkpoint preprocessing mismatch: {key}.')
     for key in ('channel_idx', 'behavior_lo', 'behavior_span'):
@@ -306,6 +306,7 @@ def main():
                       if a.window_mode == 'movement_onset' else
                       'Continuous windows require at least one behavior-valid trial long enough for model and decoder history.')
             raise ValueError(f'No eligible {label} windows. {detail}')
+        require_variable_force(day['b'][idx, :D['n_force']], f'{label} {a.split} evaluation windows')
         times, lookup = feature_times(idx, a.hist)
         sections[label] = dict(idx=idx, ids=ids, times=times, lookup=lookup, day=day)
         print(f'{label}: {len(np.unique(ids))}/{len(trials)} eligible trials, {len(idx)} {a.window_mode} windows')

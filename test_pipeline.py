@@ -11,6 +11,7 @@ from dataloader import (_bin_xds, antialias_resample, behavior_masks, force_deri
                         load_npz, make_synthetic, session_segments, split_intervals)
 from evaluate import (causal_infer, feature_times, model_from_checkpoint,
                       r2vw, spike_baseline, trial_index, validate_pair)
+from generate_report import split_condition
 from lfads import GRUCell, LFADS, coordinated_dropout, lfads_loss, poisson_nll, spike_jitter
 from nomad import mvn_kl
 from train_phase1 import ramp as phase1_ramp
@@ -99,12 +100,13 @@ class PipelineTests(unittest.TestCase):
         archive['format_version'] = np.array(4)
         path = self.root / 'legacy.npz'
         np.savez_compressed(path, **archive)
-        with self.assertRaisesRegex(ValueError, 'format 6'):
+        with self.assertRaisesRegex(ValueError, 'format 7'):
             load_npz(path)
 
     def test_behavior_antialias_filter_attenuates_above_target_nyquist(self):
         native_bin, target_bin = .001, .02
-        native_times = np.arange(4000) * native_bin
+        # Four seconds between reflection endpoints, so both tones fit exactly.
+        native_times = np.arange(4001) * native_bin
         target_times = native_times[::20]
         bounds = np.array([[0, len(target_times)]])
         low = np.sin(2 * np.pi * 3 * native_times)
@@ -113,17 +115,17 @@ class PipelineTests(unittest.TestCase):
                                           bounds, native_bin, target_bin)[:, 0]
         filtered_high = antialias_resample(high[:, None], native_times, target_times,
                                            bounds, native_bin, target_bin)[:, 0]
-        raw_high = high[::20]
-        # Ignore boundary transients from the zero-phase finite-interval filter.
-        interior = slice(100, -100)
-        self.assertGreater(np.std(filtered_low[interior]), .6)
-        self.assertLess(np.std(filtered_high[interior]), .02 * np.std(raw_high))
+        ripple = np.expm1(.05 * np.log(10) / 10)
+        warped = np.tan(np.pi * 3 * native_bin) / np.tan(np.pi * 20 * native_bin)
+        gain = 1 / (1 + ripple * np.cos(500 * np.arccos(warped)) ** 2)
+        np.testing.assert_allclose(filtered_low, gain * low[::20], atol=1e-6, rtol=0)
+        self.assertLess(np.max(np.abs(filtered_high)), 1e-6)
 
     def test_behavior_filter_never_uses_samples_from_another_owned_interval(self):
         native_bin, target_bin = .001, .02
         native_times = np.arange(8000) * native_bin
         target_times = native_times[::20]
-        bounds = np.array([[0, 200], [200, 400]])
+        bounds = np.array([[0, 180], [200, 400]])
         values = np.sin(2 * np.pi * 3 * native_times)[:, None]
         changed = values.copy()
         changed[4000:] += 1000
@@ -132,6 +134,20 @@ class PipelineTests(unittest.TestCase):
         after = antialias_resample(changed, native_times, target_times, bounds,
                                    native_bin, target_bin)
         np.testing.assert_array_equal(before[:200], after[:200])
+        self.assertGreater(np.std(before[:200]), .6)
+        self.assertGreater(np.mean(after[200:] - before[200:]), 900)
+
+    def test_archive_rejects_constant_force_with_varying_other_behavior(self):
+        archive = copy.deepcopy(self.a)
+        archive['b_k'][:, :2] = [17, -21]
+        path = self.root / 'constant_target.npz'
+        np.savez_compressed(path, **archive)
+        with self.assertRaisesRegex(ValueError, 'dayk.*constant force'):
+            load_npz(path)
+
+    def test_report_distinguishes_unsupervised_and_supervised_alignment(self):
+        self.assertEqual(split_condition('day-k test, unsupervised alignment'), 'alignment_unsupervised')
+        self.assertEqual(split_condition('day-k test, supervised alignment'), 'alignment_supervised')
 
     def test_behavior_resampling_at_native_rate_is_exact(self):
         values = np.arange(40, dtype=np.float64).reshape(20, 2)
